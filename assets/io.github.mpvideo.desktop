@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MpVideo
+GenericName=Video Player
+Comment=Play video files
+Exec=mpvideo %U
+Icon=io.github.mpvideo
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Player;
+MimeType=video/mp4;video/mpeg;video/webm;video/x-matroska;video/quicktime;
+StartupNotify=true
