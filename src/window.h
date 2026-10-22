@@ -3,6 +3,7 @@
 #include "player.h"
 #include <QMainWindow>
 #include <QPointer>
+#include <QSettings>
 #include <functional>
 class QLabel;
 class QSlider;
@@ -11,6 +12,7 @@ class QLineEdit;
 class QVBoxLayout;
 class QStackedLayout;
 namespace mpvideo {
+class DesktopFilePicker;
 class VideoWidget;
 class IconButton;
 class Modal;
@@ -30,6 +32,7 @@ class Window : public QMainWindow {
   private:
     Player player_;
     ThemeManager theme_;
+    QSettings settings_;
     QWidget *content_;
     VideoWidget *video_ = nullptr;
     QStackedLayout *stageStack_;
@@ -43,6 +46,7 @@ class Window : public QMainWindow {
     IconButton *mute_;
     QListWidget *queue_;
     QPointer<Modal> modal_;
+    QPointer<DesktopFilePicker> desktopFilePicker_;
     void build();
     void buildHeader(QVBoxLayout *layout);
     void buildStage(QVBoxLayout *layout);
@@ -52,8 +56,13 @@ class Window : public QMainWindow {
     void refresh();
     void shortcuts();
     void fileDialog(bool subtitles = false);
+    void builtInFileDialog(bool subtitles);
+    void desktopFileDialog(bool subtitles);
+    bool useBuiltInFilePicker() const;
     void trackDialog();
     void settingsDialog();
+    void buildSpeedSettings(Modal *modal);
+    void buildFilePickerSetting(Modal *modal);
     Modal *dialog(const QString &title);
     void fullscreen();
 };

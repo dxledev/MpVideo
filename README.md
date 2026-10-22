@@ -2,11 +2,11 @@
 
 A portable, standalone video player for Linux. Written in C++20 with Qt 6 and powered by libmpv. No GTK interface or web runtime.
 
-Open files or stream URLs, drop media onto the window, manage a playback queue, select audio and subtitles, load subtitle files, adjust playback speed, repeat media, and watch in fullscreen. Dialogs stay inside the player window. The flat interface uses theme-colored vector controls.
+Open files or stream URLs, drop media onto the window, manage a playback queue, select audio and subtitles, load subtitle files, adjust playback speed, repeat media, and watch in fullscreen. Dialogs stay inside the player window by default, with an optional desktop file chooser. The flat interface uses theme-colored vector controls.
 
 ## Build
 
-Dependencies: CMake, a C++20 compiler, pkg-config, Qt 6.7+ (Core, Gui, Widgets, OpenGLWidgets), and libmpv development files. Tests also require Qt Test and FFmpeg; headless render tests can use Xvfb. On Arch Linux the relevant packages are `base-devel cmake ninja pkgconf qt6-base qt6-wayland mpv`.
+Dependencies: CMake, a C++20 compiler, pkg-config, Qt 6.7+ (Core, Gui, Widgets, OpenGLWidgets, DBus), and libmpv development files. The desktop file chooser uses Qt DBus and the XDG Desktop Portal FileChooser service. Tests also require Qt Test, FFmpeg, and `dbus-run-session`; headless render tests can use Xvfb. On Arch Linux the relevant packages are `base-devel cmake ninja pkgconf qt6-base qt6-wayland mpv`.
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -55,7 +55,9 @@ Use `mpvideo --help` for the complete command syntax, configurable color roles, 
 | Escape | Close a dialog / leave fullscreen |
 | Ctrl+Q | Quit |
 
-The Open dialog includes an embedded directory browser. Select a file and press Open, or activate it directly. Check **Add to queue** to append a file. Press Delete on a queue item to remove it. Directory activation navigates; URLs can be pasted into the location field. Playback errors appear below the controls.
+In **Settings**, leave **Use built-in file picker** checked to select files inside MpVideo’s embedded modal, including URL and queue options. Uncheck it to use the desktop’s configured file chooser through XDG Desktop Portal. This preference also applies to subtitle files and is saved in `settings.ini` beside `theme.json` (including when using `--config-dir`). The desktop picker supports selecting multiple media files. If the desktop chooser is unavailable, MpVideo shows an error instead of substituting a separate Qt dialog.
+
+The built-in Open dialog includes an embedded directory browser. Select a file and press Open, or activate it directly. Check **Add to queue** to append a file. Press Delete on a queue item to remove it. Directory activation navigates; URLs can be pasted into the location field. Playback errors appear below the controls.
 
 ## Implementation
 

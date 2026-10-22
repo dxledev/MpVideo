@@ -1,12 +1,16 @@
 #pragma once
+#include <QFocusEvent>
 #include <QPainter>
 #include <QPushButton>
+#include <QStyle>
 
 namespace mpvideo {
 class IconButton : public QPushButton {
   public:
     explicit IconButton(QString symbol, QString label, QWidget *parent = nullptr)
         : QPushButton(parent), symbol_(std::move(symbol)) {
+        setFocusPolicy(Qt::TabFocus);
+        setProperty("keyboardFocus", false);
         setAccessibleName(label);
         setToolTip(label);
         setFixedSize(38, 36);
@@ -18,6 +22,18 @@ class IconButton : public QPushButton {
     }
 
   protected:
+    void focusInEvent(QFocusEvent *event) override {
+        const auto reason = event->reason();
+        const bool keyboard = reason == Qt::TabFocusReason || reason == Qt::BacktabFocusReason ||
+                              reason == Qt::ShortcutFocusReason ||
+                              (reason == Qt::OtherFocusReason && property("keyboardFocus").toBool());
+        setKeyboardFocus(keyboard);
+        QPushButton::focusInEvent(event);
+    }
+    void mousePressEvent(QMouseEvent *event) override {
+        setKeyboardFocus(false);
+        QPushButton::mousePressEvent(event);
+    }
     void paintEvent(QPaintEvent *event) override {
         QPushButton::paintEvent(event);
         QPainter p(this);
@@ -80,5 +96,11 @@ class IconButton : public QPushButton {
 
   private:
     QString symbol_;
+    void setKeyboardFocus(bool visible) {
+        setProperty("keyboardFocus", visible);
+        style()->unpolish(this);
+        style()->polish(this);
+        update();
+    }
 };
 } // namespace mpvideo

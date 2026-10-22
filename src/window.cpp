@@ -1,7 +1,9 @@
 #include "window.h"
+#include "desktop_file_picker.h"
 #include "icon_button.h"
 #include "modal.h"
 #include "seek_slider.h"
+#include "themed_checkbox.h"
 #include "video_widget.h"
 #include <QApplication>
 #include <QButtonGroup>
@@ -68,7 +70,9 @@ QLabel *text(QString value, QString name = {}) {
 }
 }
 Window::Window(QString configPath, const QStringList &mpvOptions)
-    : player_(embeddedOptions(mpvOptions)), theme_(configPath, nullptr) {
+    : player_(embeddedOptions(mpvOptions)), theme_(configPath, nullptr),
+      settings_(QFileInfo(theme_.configPath()).dir().filePath("settings.ini"), QSettings::IniFormat) {
+    settings_.setFallbacksEnabled(false);
     setObjectName("mpvideoWindow");
     setWindowTitle("MpVideo");
     setMinimumSize(680, 440);
@@ -89,13 +93,17 @@ Window::Window(QString configPath, const QStringList &mpvOptions)
 
     refresh();
 }
-Window::~Window() { delete takeCentralWidget(); }
+Window::~Window() {
+    delete desktopFilePicker_;
+    delete takeCentralWidget();
+}
 void Window::build() {
     auto *root = new QWidget;
     setCentralWidget(root);
     auto *rootLayout = new QVBoxLayout(root);
     rootLayout->setContentsMargins(0, 0, 0, 0);
     content_ = new QWidget;
+    content_->setFocusPolicy(Qt::StrongFocus);
     rootLayout->addWidget(content_);
     auto *layout = new QVBoxLayout(content_);
     layout->setContentsMargins(18, 12, 18, 16);
@@ -103,6 +111,7 @@ void Window::build() {
     buildHeader(layout);
     buildStage(layout);
     buildTransport(layout);
+    content_->setFocus();
 }
 IconButton *Window::makeButton(QString icon, QString label, std::function<void()> action) {
     auto *button = new IconButton(std::move(icon), std::move(label));
@@ -120,7 +129,7 @@ void Window::buildHeader(QVBoxLayout *layout) {
     header->addWidget(makeButton("open", "Open media (Ctrl+O)", [this] { fileDialog(); }));
     header->addWidget(
         makeButton("queue", "Toggle queue (P)", [this] { queue_->setVisible(!queue_->isVisible()); }));
-    header->addWidget(makeButton("settings", "Playback settings", [this] { settingsDialog(); }));
+    header->addWidget(makeButton("settings", "Settings", [this] { settingsDialog(); }));
     layout->addLayout(header);
 }
 void Window::buildStage(QVBoxLayout *layout) {
@@ -139,6 +148,14 @@ void Window::buildStage(QVBoxLayout *layout) {
     empty_->setWordWrap(true);
     empty_->setAttribute(Qt::WA_TransparentForMouseEvents);
     stack->addWidget(empty_);
+    if (player_.isReady()) {
+        // Adding the first OpenGL widget after show() recreates the native window.
+        // Keep it hidden here so libmpv rendering still starts only on selection.
+        video_ = new VideoWidget(&player_);
+        stack->addWidget(video_);
+        connect(video_, &VideoWidget::error, this,
+                [this](const QString &message) { status_->setText(message); });
+    }
     stack->setCurrentWidget(empty_);
     middle->addWidget(stage, 1);
     queue_ = new QListWidget;
@@ -198,6 +215,8 @@ void Window::applyTheme() {
     palette.setColor(QPalette::Window, theme_.theme().color("background"));
     palette.setColor(QPalette::WindowText, theme_.theme().color("text"));
     palette.setColor(QPalette::Text, theme_.theme().color("text"));
+    palette.setColor(QPalette::Button, theme_.theme().color("surface_alt"));
+    palette.setColor(QPalette::Mid, theme_.theme().color("border"));
     palette.setColor(QPalette::ButtonText, theme_.theme().color("text"));
     palette.setColor(QPalette::Base, theme_.theme().color("surface"));
     palette.setColor(QPalette::Highlight, theme_.theme().color("accent"));
@@ -213,6 +232,12 @@ QLabel#empty { color:%5; font-size:16px; } QLabel#status, QLabel#mediaTitle { co
 QPushButton { background:transparent; border:1px solid transparent; border-radius:6px; padding:6px 12px; }
 QPushButton:hover { background:%6; } QPushButton:pressed, QPushButton:checked { background:%3; }
 QPushButton:focus, QLineEdit:focus, QListWidget:focus { border:1px solid %7; }
+QPushButton[keyboardFocus="false"]:focus { border-color:transparent; }
+QWidget#settingsModal QPushButton { background:%4; border:1px solid %3; }
+QWidget#settingsModal QPushButton:hover { background:%6; border-color:%7; }
+QWidget#settingsModal QPushButton:pressed, QWidget#settingsModal QPushButton:checked { background:%7; color:%9; border-color:%7; }
+QWidget#settingsModal QPushButton:focus { border-color:%7; }
+QWidget#settingsModal QPushButton[keyboardFocus="false"]:focus { border-color:%3; }
 QPushButton:disabled { color:%5; } QLineEdit, QListWidget { background:%4; border:1px solid %3; border-radius:6px; padding:8px; }
 QListWidget::item { padding:9px 4px; } QListWidget::item:selected { background:%6; }
 QSlider::groove:horizontal { height:4px; background:%8; border-radius:2px; }
@@ -223,8 +248,9 @@ QScrollArea { background:transparent; border:0; } QScrollBar:vertical { backgrou
 )")
                             .arg(c("text"), c("background"), c("border"), c("surface"), c("muted"),
                                  c("surface_alt"), c("accent"),
-                                 mutedTrack(theme_.theme().color("muted"),
-                                            theme_.theme().color("background")).name(QColor::HexArgb)));
+                                 mutedTrack(theme_.theme().color("muted"), theme_.theme().color("background"))
+                                     .name(QColor::HexArgb),
+                                 c("accent_text")));
 }
 void Window::refresh() {
     const auto duration = player_.property("duration").toDouble(),
@@ -268,13 +294,6 @@ void Window::refresh() {
 void Window::open(const QStringList &paths, bool append) {
     if (paths.isEmpty() || !player_.isReady())
         return;
-    // Avoid allocating a GPU renderer and hardware-decoder drivers for an idle window.
-    if (!video_) {
-        video_ = new VideoWidget(&player_);
-        stageStack_->addWidget(video_);
-        connect(video_, &VideoWidget::error, this,
-                [this](const QString &message) { status_->setText(message); });
-    }
     stageStack_->setCurrentWidget(video_);
     bool add = append;
     for (const auto &path : paths) {
@@ -286,12 +305,55 @@ void Window::open(const QStringList &paths, bool append) {
     status_->setText("Opening media…");
 }
 Modal *Window::dialog(const QString &title) {
-    if (modal_)
+    if (modal_ || desktopFilePicker_)
         return nullptr;
-    modal_ = new Modal(centralWidget(), content_, title);
-    return modal_;
+    auto *modal = new Modal(centralWidget(), content_, title);
+    modal_ = modal;
+    connect(modal, &Modal::dismissed, this, [this] { modal_.clear(); });
+    return modal;
 }
 void Window::fileDialog(bool subtitles) {
+    if (modal_ || desktopFilePicker_)
+        return;
+    if (useBuiltInFilePicker())
+        builtInFileDialog(subtitles);
+    else
+        desktopFileDialog(subtitles);
+}
+bool Window::useBuiltInFilePicker() const {
+    return settings_.value("files/useBuiltInPicker", settings_.value("files/useNativeDialog", true)).toBool();
+}
+void Window::desktopFileDialog(bool subtitles) {
+    auto *picker = new DesktopFilePicker(this);
+    desktopFilePicker_ = picker;
+    const auto previousStatus = status_->text();
+    const QString waiting = "Choose a file in your desktop file manager…";
+    status_->setText(waiting);
+    content_->setEnabled(false);
+    connect(picker, &DesktopFilePicker::selected, this, [this, subtitles](const QStringList &paths) {
+        if (subtitles)
+            player_.command({"sub-add", paths.first(), "select"});
+        else
+            open(paths);
+    });
+    connect(picker, &DesktopFilePicker::failed, this, [this](const QString &message) {
+        status_->setText(message);
+        status_->setToolTip(message);
+    });
+    connect(picker, &DesktopFilePicker::finished, this, [this, picker, previousStatus, waiting] {
+        content_->setEnabled(true);
+        content_->setFocus();
+        if (status_->text() == waiting)
+            status_->setText(previousStatus);
+        desktopFilePicker_.clear();
+        picker->deleteLater();
+    });
+    QString parentWindow;
+    if (QGuiApplication::platformName() == "xcb")
+        parentWindow = "x11:" + QString::number(winId(), 16);
+    picker->open(subtitles ? "Add subtitles" : "Open media", !subtitles, parentWindow);
+}
+void Window::builtInFileDialog(bool subtitles) {
     auto *modal = dialog(subtitles ? "Add subtitles" : "Open media");
     if (!modal)
         return;
@@ -409,22 +471,12 @@ void Window::trackDialog() {
     modal->present();
 }
 void Window::settingsDialog() {
-    auto *modal = dialog("Playback settings");
+    auto *modal = dialog("Settings");
     if (!modal)
         return;
-    modal->body()->addWidget(text("Playback speed", "heading"));
-    auto *row = new QHBoxLayout;
-    for (double speed : {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}) {
-        auto *b = new QPushButton(QString::number(speed) + "×");
-        row->addWidget(b);
-        connect(b, &QPushButton::clicked, modal, [this, speed] { player_.setProperty("speed", speed); });
-    }
-    modal->body()->addLayout(row);
-    auto *loop = new QCheckBox("Repeat current media");
-    loop->setChecked(player_.property("loop-file").toString() == "inf");
-    modal->body()->addWidget(loop);
-    connect(loop, &QCheckBox::toggled, modal,
-            [this](bool on) { player_.setProperty("loop-file", on ? "inf" : "no"); });
+    modal->setObjectName("settingsModal");
+    buildSpeedSettings(modal);
+    buildFilePickerSetting(modal);
     auto *help = text("Space  Play / pause\nLeft / Right  Seek 5 seconds\nUp / Down  "
                       "Change volume\nM  Mute    F  Fullscreen    P  Queue\nCtrl+O  Open "
                       "media    Ctrl+Q  Quit\nEscape  Close dialog / leave fullscreen");
@@ -437,11 +489,50 @@ void Window::settingsDialog() {
     modal->body()->addStretch();
     modal->present();
 }
+void Window::buildSpeedSettings(Modal *modal) {
+    modal->body()->addWidget(text("Playback speed", "heading"));
+    auto *row = new QHBoxLayout;
+    auto *group = new QButtonGroup(modal);
+    for (double speed : {0.5, 0.75, 1.0, 1.25, 1.5, 2.0}) {
+        auto *button = new QPushButton(QString::number(speed) + "×");
+        button->setCheckable(true);
+        button->setFocusPolicy(Qt::TabFocus);
+        button->setCursor(Qt::PointingHandCursor);
+        group->addButton(button);
+        row->addWidget(button);
+        auto refreshSpeed = [this, button, speed] {
+            button->setChecked(qFuzzyCompare(player_.property("speed").toDouble(), speed));
+        };
+        refreshSpeed();
+        connect(&player_, &Player::changed, button, refreshSpeed);
+        connect(button, &QPushButton::clicked, modal, [this, speed] { player_.setProperty("speed", speed); });
+    }
+    modal->body()->addLayout(row);
+    auto *loop = new ThemedCheckBox("Repeat current media");
+    loop->setChecked(player_.property("loop-file").toString() == "inf");
+    modal->body()->addWidget(loop);
+    connect(loop, &QCheckBox::toggled, modal,
+            [this](bool on) { player_.setProperty("loop-file", on ? "inf" : "no"); });
+}
+void Window::buildFilePickerSetting(Modal *modal) {
+    auto *builtIn = new ThemedCheckBox("Use built-in file picker");
+    builtIn->setChecked(useBuiltInFilePicker());
+    modal->body()->addWidget(builtIn);
+    auto *hint = text("Turn off to use your desktop’s default file chooser.", "status");
+    hint->setWordWrap(true);
+    modal->body()->addWidget(hint);
+    connect(builtIn, &QCheckBox::toggled, modal, [this, hint](bool enabled) {
+        settings_.setValue("files/useBuiltInPicker", enabled);
+        settings_.sync();
+        if (settings_.status() != QSettings::NoError)
+            hint->setText("Could not save this setting. It will apply for this session.");
+    });
+}
 void Window::shortcuts() {
     auto bind = [this](QString key, auto fn) {
         auto *s = new QShortcut(QKeySequence(key), this);
         connect(s, &QShortcut::activated, this, [this, fn] {
-            if (!modal_)
+            if (!modal_ && !desktopFilePicker_)
                 fn();
         });
     };
@@ -472,7 +563,7 @@ void Window::resizeEvent(QResizeEvent *e) {
         modal_->setGeometry(centralWidget()->rect());
 }
 void Window::dragEnterEvent(QDragEnterEvent *e) {
-    if (e->mimeData()->hasUrls() && !modal_)
+    if (e->mimeData()->hasUrls() && !modal_ && !desktopFilePicker_)
         e->acceptProposedAction();
 }
 void Window::dropEvent(QDropEvent *e) {
@@ -484,7 +575,9 @@ void Window::dropEvent(QDropEvent *e) {
 }
 void Window::keyPressEvent(QKeyEvent *e) {
     if (e->key() == Qt::Key_Escape) {
-        if (modal_)
+        if (desktopFilePicker_)
+            desktopFilePicker_->cancel();
+        else if (modal_)
             modal_->dismiss();
         else if (isFullScreen())
             showNormal();
