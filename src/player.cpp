@@ -101,6 +101,8 @@ Player::Player(const QStringList &options, QObject *parent)
         optionResult = mpv_set_option_string(handle_, "input-vo-keyboard", "no");
     if (optionResult >= 0)
         optionResult = mpv_set_option_string(handle_, "hwdec", "auto-safe");
+    if (optionResult >= 0)
+        optionResult = mpv_set_option_string(handle_, "keep-open", "yes");
 
     for (const QString &option : options) {
         const qsizetype separator = option.indexOf('=');
