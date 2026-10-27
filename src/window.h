@@ -28,6 +28,7 @@ class Window : public QMainWindow {
     void dragEnterEvent(QDragEnterEvent *) override;
     void dropEvent(QDropEvent *) override;
     void keyPressEvent(QKeyEvent *) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
   private:
     Player player_;

@@ -16,6 +16,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMimeData>
+#include <QMouseEvent>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -146,7 +147,8 @@ void Window::buildStage(QVBoxLayout *layout) {
                   "empty");
     empty_->setAlignment(Qt::AlignCenter);
     empty_->setWordWrap(true);
-    empty_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    empty_->setCursor(Qt::PointingHandCursor);
+    empty_->installEventFilter(this);
     stack->addWidget(empty_);
     if (player_.isReady()) {
         // Adding the first OpenGL widget after show() recreates the native window.
@@ -561,6 +563,14 @@ void Window::resizeEvent(QResizeEvent *e) {
     QMainWindow::resizeEvent(e);
     if (modal_)
         modal_->setGeometry(centralWidget()->rect());
+}
+bool Window::eventFilter(QObject *watched, QEvent *event) {
+    if (watched == empty_ && event->type() == QEvent::MouseButtonRelease &&
+        static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+        fileDialog(false);
+        return true;
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 void Window::dragEnterEvent(QDragEnterEvent *e) {
     if (e->mimeData()->hasUrls() && !modal_ && !desktopFilePicker_)
