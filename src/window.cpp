@@ -88,7 +88,15 @@ Window::Window(QString configPath, const QStringList &mpvOptions)
     connect(&theme_, &ThemeManager::changed, this, &Window::applyTheme);
     connect(&theme_, &ThemeManager::rejected, this,
             [this](const QString &e) { status_->setText("Theme unchanged: " + e); });
-    connect(&player_, &Player::changed, this, &Window::refresh);
+    // mpv reports time-pos every frame; coalesce so the UI is not rebuilt per frame over the GL surface.
+    refreshTimer_ = new QTimer(this);
+    refreshTimer_->setSingleShot(true);
+    refreshTimer_->setInterval(33);
+    connect(refreshTimer_, &QTimer::timeout, this, &Window::refresh);
+    connect(&player_, &Player::changed, this, [this] {
+        if (!refreshTimer_->isActive())
+            refreshTimer_->start();
+    });
     auto error = [this](const QString &message) {
         status_->setText(message);
         status_->setToolTip(message);
@@ -184,12 +192,7 @@ void Window::buildStage(QVBoxLayout *layout) {
         video_ = new VideoWidget(&player_);
         stack->addWidget(video_);
         connect(video_, &VideoWidget::clicked, this, [this] {
-            // The indicator shows the state being switched to.
-            bool wasPaused = player_.property("pause").toBool();
-            player_.command({"cycle", "pause"});
-            pauseIndicator_->move(video_->mapTo(content_, video_->rect().center()) -
-                                  QPoint(pauseIndicator_->width() / 2, pauseIndicator_->height() / 2));
-            pauseIndicator_->flash(wasPaused);
+            togglePause();
         });
         connect(video_, &VideoWidget::error, this,
                 [this](const QString &message) { status_->setText(message); });
@@ -220,7 +223,7 @@ void Window::buildTransport(QVBoxLayout *layout) {
         makeButton("previous", "Previous media", [this] { player_.command({"playlist-prev", "weak"}); }));
     skipBack_ = makeButton("skipBack", {}, [this] { skip(-1); });
     controls->addWidget(skipBack_);
-    play_ = makeButton("play", "Play or pause (Space)", [this] { player_.command({"cycle", "pause"}); });
+    play_ = makeButton("play", "Play or pause (Space)", [this] { togglePause(); });
     controls->addWidget(play_);
     skipForward_ = makeButton("skipForward", {}, [this] { skip(1); });
     controls->addWidget(skipForward_);
@@ -300,23 +303,29 @@ void Window::refresh() {
                pos = player_.property("time-pos").toDouble();
     bool idle = !player_.property("idle-active").isValid() || player_.property("idle-active").toBool();
     stageStack_->setCurrentWidget(idle || !video_ ? static_cast<QWidget *>(empty_) : video_);
-    play_->setSymbol(player_.property("pause").toBool() || idle ? "play" : "pause");
+    const bool paused = player_.property("pause").toBool();
+    if (pendingPause_ && (*pendingPause_ == paused || idle))
+        pendingPause_.reset();
+    play_->setSymbol(pendingPause_.value_or(paused) || idle ? "play" : "pause");
     play_->setEnabled(!idle);
     seek_->setEnabled(duration > 0);
     if (!seek_->isSliderDown()) {
         QSignalBlocker block(seek_);
         seek_->setValue(duration > 0 ? qBound(0, int(pos / duration * 10000), 10000) : 0);
     }
-    time_->setText(stamp(pos) + " / " + stamp(duration));
+    if (const auto stampText = stamp(pos) + " / " + stamp(duration); time_->text() != stampText)
+        time_->setText(stampText);
     if (!volume_->isSliderDown()) {
         QSignalBlocker block(volume_);
         volume_->setValue(player_.property("volume").toInt());
     }
     mute_->setSymbol(player_.property("mute").toBool() ? "mute" : "volume");
     auto title = player_.property("media-title").toString();
-    title_->setText(title);
-    title_->setToolTip(title);
-    setWindowTitle(title.isEmpty() ? "MpVideo" : title + " · MpVideo");
+    if (title_->text() != title) {
+        title_->setText(title);
+        title_->setToolTip(title);
+        setWindowTitle(title.isEmpty() ? "MpVideo" : title + " · MpVideo");
+    }
     if (status_->text() == "Opening media…" && !title.isEmpty())
         status_->setText("Playback ready · mpv");
     const auto list = player_.playlist();
@@ -332,7 +341,8 @@ void Window::refresh() {
         }
         queue_->setProperty("entries", list);
     }
-    queue_->setCurrentRow(player_.property("playlist-pos").toInt());
+    if (const int row = player_.property("playlist-pos").toInt(); queue_->currentRow() != row)
+        queue_->setCurrentRow(row);
 }
 void Window::open(const QStringList &paths, bool append) {
     if (paths.isEmpty() || !player_.isReady())
@@ -568,6 +578,18 @@ void Window::buildSpeedSettings(Modal *modal) {
             [this](bool on) { player_.setProperty("loop-file", on ? "inf" : "no"); });
 }
 int Window::skipSeconds() const { return qBound(1, settings_.value("playback/skipSeconds", 5).toInt(), 90); }
+// mpv reports "pause" asynchronously, so rapid toggles track the requested state instead of the cached one.
+void Window::togglePause() {
+    const bool nowPaused = !pendingPause_.value_or(player_.property("pause").toBool());
+    pendingPause_ = nowPaused;
+    player_.setProperty("pause", nowPaused);
+    play_->setSymbol(nowPaused ? "play" : "pause");
+    if (!video_ || stageStack_->currentWidget() != video_)
+        return;
+    pauseIndicator_->move(video_->mapTo(content_, video_->rect().center()) -
+                          QPoint(pauseIndicator_->width() / 2, pauseIndicator_->height() / 2));
+    pauseIndicator_->flash(!nowPaused);
+}
 void Window::skip(int direction) {
     player_.command({"seek", QString::number(direction * skipSeconds()), "relative"});
     if (!video_ || stageStack_->currentWidget() != video_)
@@ -633,7 +655,7 @@ void Window::shortcuts() {
                 fn();
         });
     };
-    bind("Space", [this] { player_.command({"cycle", "pause"}); });
+    bind("Space", [this] { togglePause(); });
     bind("Left", [this] { skip(-1); });
     bind("Right", [this] { skip(1); });
     bind("Up",

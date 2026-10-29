@@ -20,12 +20,14 @@ class PauseIndicator : public QWidget {
         connect(anim_, &QVariantAnimation::valueChanged, this, [this](const QVariant &v) {
             opacity_ = v.toReal();
             update();
+            repaintBehind();
         });
         connect(anim_, &QVariantAnimation::finished, this, &QWidget::hide);
     }
     void flash(bool playing) {
         skip_ = 0;
         playing_ = playing;
+        repaintBehind();
         restart();
     }
     // direction < 0 shows a rewind badge, > 0 a fast-forward badge, both with the amount of time.
@@ -36,6 +38,12 @@ class PauseIndicator : public QWidget {
     }
 
   protected:
+    // Over the GL video the badge alone is flushed stale in fullscreen; dirty the area behind it too.
+    void repaintBehind() {
+        update();
+        if (parentWidget())
+            parentWidget()->update(geometry());
+    }
     void restart() {
         opacity_ = 1;
         show();

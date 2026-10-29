@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include "palette/theme_manager.h"
 #include "player.h"
 #include <QMainWindow>
@@ -42,6 +43,9 @@ class Window : public QMainWindow {
     QStackedLayout *stageStack_;
     QVBoxLayout *layout_;
     PauseIndicator *pauseIndicator_;
+    std::optional<bool> pendingPause_;
+    void togglePause();
+    QTimer *refreshTimer_ = nullptr;
     PauseIndicator *skipBackIndicator_;
     PauseIndicator *skipForwardIndicator_;
     QWidget *header_;

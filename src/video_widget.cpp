@@ -76,8 +76,10 @@ void VideoWidget::paintGL() {
                                .h = std::max(1, qRound(height() * scale)),
                                .internal_format = 0};
     int flipY = 1;
+    int blockForTarget = 0; // the widget's swap paces frames; never sleep inside paintGL
     mpv_render_param parameters[]{{MPV_RENDER_PARAM_OPENGL_FBO, &framebuffer},
                                   {MPV_RENDER_PARAM_FLIP_Y, &flipY},
+                                  {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &blockForTarget},
                                   {MPV_RENDER_PARAM_INVALID, nullptr}};
 
     glContext->functions()->glViewport(0, 0, framebuffer.w, framebuffer.h);

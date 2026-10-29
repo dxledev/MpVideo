@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
         QSurfaceFormat format;
         format.setDepthBufferSize(0);
         format.setStencilBufferSize(0);
-        format.setSwapInterval(1);
+        // QOpenGLWidget renders to an FBO and the window's own swap does the vsync; vsyncing both stalls paintGL.
+        format.setSwapInterval(0);
         QSurfaceFormat::setDefaultFormat(format);
         QApplication app(argc, argv);
         mpvideo::TooltipFilter tooltips(&app);
