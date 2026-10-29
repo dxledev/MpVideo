@@ -27,10 +27,12 @@ class VideoWidget final : public QOpenGLWidget {
 
   signals:
     void error(const QString &message);
+    void clicked();
 
   protected:
     void initializeGL() override;
     void paintGL() override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
 
   private:
     struct CallbackBridge;

@@ -1,4 +1,5 @@
 #include "video_widget.h"
+#include <QMouseEvent>
 
 #include "player.h"
 
@@ -196,3 +197,11 @@ void VideoWidget::reportRenderError(const QString &message) {
 }
 
 }
+
+namespace mpvideo {
+void VideoWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (event->button() == Qt::LeftButton)
+        emit clicked();
+    QOpenGLWidget::mouseReleaseEvent(event);
+}
+} // namespace mpvideo

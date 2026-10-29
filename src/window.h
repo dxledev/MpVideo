@@ -11,11 +11,14 @@ class QListWidget;
 class QLineEdit;
 class QVBoxLayout;
 class QStackedLayout;
+class QTimer;
+class QVariantAnimation;
 namespace mpvideo {
 class DesktopFilePicker;
 class VideoWidget;
 class IconButton;
 class Modal;
+class PauseIndicator;
 class Window : public QMainWindow {
     Q_OBJECT
   public:
@@ -37,6 +40,26 @@ class Window : public QMainWindow {
     QWidget *content_;
     VideoWidget *video_ = nullptr;
     QStackedLayout *stageStack_;
+    QVBoxLayout *layout_;
+    PauseIndicator *pauseIndicator_;
+    PauseIndicator *skipBackIndicator_;
+    PauseIndicator *skipForwardIndicator_;
+    QWidget *header_;
+    QWidget *footer_;
+    struct Bar {
+        QWidget *widget;
+        QVariantAnimation *anim;
+        QTimer *delay;
+        bool top;
+        bool shown = false;
+        qreal pos = 1; // 0 = fully off-screen, 1 = fully visible
+    };
+    Bar bars_[2];
+    QTimer *cursorTimer_;
+    QPoint lastCursor_;
+    QTimer *hideTimer_;
+    bool immersive_ = false;
+    bool introDone_ = false;
     QLabel *empty_;
     QLabel *title_;
     QLabel *time_;
@@ -44,6 +67,8 @@ class Window : public QMainWindow {
     QSlider *seek_;
     QSlider *volume_;
     IconButton *play_;
+    IconButton *skipBack_;
+    IconButton *skipForward_;
     IconButton *mute_;
     QListWidget *queue_;
     QPointer<Modal> modal_;
@@ -66,5 +91,14 @@ class Window : public QMainWindow {
     void buildFilePickerSetting(Modal *modal);
     Modal *dialog(const QString &title);
     void fullscreen();
+    int skipSeconds() const;
+    void skip(int direction);
+    void updateSkipButtons();
+    void buildSkipSetting(Modal *modal);
+    void setImmersive(bool on);
+    void placeBars();
+    void updateBars(bool immediate);
+    void initBars();
+    void slideBar(Bar &bar, bool show);
 };
 } // namespace mpvideo

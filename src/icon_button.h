@@ -3,6 +3,7 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QStyle>
+#include <cmath>
 
 namespace mpvideo {
 class IconButton : public QPushButton {
@@ -18,6 +19,11 @@ class IconButton : public QPushButton {
     }
     void setSymbol(QString symbol) {
         symbol_ = std::move(symbol);
+        update();
+    }
+
+    void setBadge(QString badge) {
+        badge_ = std::move(badge);
         update();
     }
 
@@ -78,6 +84,31 @@ class IconButton : public QPushButton {
             }
             p.drawPolygon(QPolygonF{QPointF(5, 5), QPointF(16, 12), QPointF(5, 19)});
             p.drawLine(19, 5, 19, 19);
+        } else if (symbol_ == "skipBack" || symbol_ == "skipForward") {
+            // Circular arrow with the skip length in the middle; forward is the mirror image of back.
+            if (symbol_ == "skipForward") {
+                p.translate(24, 0);
+                p.scale(-1, 1);
+            }
+            const QPointF c(12, 13);
+            const qreal r = 8, end = 10 * M_PI / 180;
+            p.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), 90 * 16, 280 * 16);
+            const QPointF tip(c.x() + r * std::cos(end), c.y() - r * std::sin(end));
+            const QPointF dir(-std::sin(end), -std::cos(end));
+            for (qreal turn : {0.6, -0.6}) {
+                const qreal a = std::atan2(-dir.y(), -dir.x()) + turn;
+                p.drawLine(tip, tip + QPointF(5 * std::cos(a), 5 * std::sin(a)));
+            }
+            if (symbol_ == "skipForward") {
+                p.scale(-1, 1);
+                p.translate(-24, 0);
+            }
+            QFont f = p.font();
+            f.setPixelSize(8);
+            f.setBold(true);
+            p.setFont(f);
+            p.setPen(color);
+            p.drawText(QRectF(4, 6, 16, 14), Qt::AlignCenter, badge_);
         } else if (symbol_ == "settings") {
             p.drawLine(4, 7, 20, 7);
             p.drawLine(4, 17, 20, 17);
@@ -96,6 +127,7 @@ class IconButton : public QPushButton {
 
   private:
     QString symbol_;
+    QString badge_;
     void setKeyboardFocus(bool visible) {
         setProperty("keyboardFocus", visible);
         style()->unpolish(this);

@@ -2,10 +2,12 @@
 #include "desktop_file_picker.h"
 #include "icon_button.h"
 #include "modal.h"
+#include "pause_indicator.h"
 #include "seek_slider.h"
 #include "themed_checkbox.h"
 #include "video_widget.h"
 #include <QApplication>
+#include <QCursor>
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QDir>
@@ -22,6 +24,7 @@
 #include <QSlider>
 #include <QStackedLayout>
 #include <QTimer>
+#include <QVariantAnimation>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <cmath>
@@ -106,12 +109,37 @@ void Window::build() {
     content_ = new QWidget;
     content_->setFocusPolicy(Qt::StrongFocus);
     rootLayout->addWidget(content_);
-    auto *layout = new QVBoxLayout(content_);
-    layout->setContentsMargins(18, 12, 18, 16);
-    layout->setSpacing(10);
-    buildHeader(layout);
-    buildStage(layout);
-    buildTransport(layout);
+    layout_ = new QVBoxLayout(content_);
+    layout_->setContentsMargins(18, 12, 18, 16);
+    layout_->setSpacing(10);
+    header_ = new QWidget(content_);
+    header_->setObjectName("bar");
+    header_->setAttribute(Qt::WA_StyledBackground);
+    auto *headerLayout = new QVBoxLayout(header_);
+    headerLayout->setContentsMargins(0, 0, 0, 0);
+    footer_ = new QWidget(content_);
+    footer_->setObjectName("bar");
+    footer_->setAttribute(Qt::WA_StyledBackground);
+    auto *footerLayout = new QVBoxLayout(footer_);
+    footerLayout->setContentsMargins(0, 0, 0, 0);
+    footerLayout->setSpacing(10);
+    pauseIndicator_ = new PauseIndicator(content_);
+    skipBackIndicator_ = new PauseIndicator(content_);
+    skipForwardIndicator_ = new PauseIndicator(content_);
+    layout_->addWidget(header_);
+    buildHeader(headerLayout);
+    buildStage(layout_);
+    layout_->addWidget(footer_);
+    buildTransport(footerLayout);
+    hideTimer_ = new QTimer(this);
+    hideTimer_->setSingleShot(true);
+    hideTimer_->setInterval(2000);
+    connect(hideTimer_, &QTimer::timeout, this, [this] { introDone_ = true; updateBars(true); });
+    initBars();
+    auto *poll = new QTimer(this);
+    poll->setInterval(80);
+    connect(poll, &QTimer::timeout, this, [this] { updateBars(false); });
+    poll->start();
     content_->setFocus();
 }
 IconButton *Window::makeButton(QString icon, QString label, std::function<void()> action) {
@@ -155,6 +183,14 @@ void Window::buildStage(QVBoxLayout *layout) {
         // Keep it hidden here so libmpv rendering still starts only on selection.
         video_ = new VideoWidget(&player_);
         stack->addWidget(video_);
+        connect(video_, &VideoWidget::clicked, this, [this] {
+            // The indicator shows the state being switched to.
+            bool wasPaused = player_.property("pause").toBool();
+            player_.command({"cycle", "pause"});
+            pauseIndicator_->move(video_->mapTo(content_, video_->rect().center()) -
+                                  QPoint(pauseIndicator_->width() / 2, pauseIndicator_->height() / 2));
+            pauseIndicator_->flash(wasPaused);
+        });
         connect(video_, &VideoWidget::error, this,
                 [this](const QString &message) { status_->setText(message); });
     }
@@ -182,8 +218,13 @@ void Window::buildTransport(QVBoxLayout *layout) {
     controls->setSpacing(8);
     controls->addWidget(
         makeButton("previous", "Previous media", [this] { player_.command({"playlist-prev", "weak"}); }));
+    skipBack_ = makeButton("skipBack", {}, [this] { skip(-1); });
+    controls->addWidget(skipBack_);
     play_ = makeButton("play", "Play or pause (Space)", [this] { player_.command({"cycle", "pause"}); });
     controls->addWidget(play_);
+    skipForward_ = makeButton("skipForward", {}, [this] { skip(1); });
+    controls->addWidget(skipForward_);
+    updateSkipButtons();
     controls->addWidget(
         makeButton("next", "Next media", [this] { player_.command({"playlist-next", "weak"}); }));
     time_ = text("0:00 / 0:00", "time");
@@ -477,11 +518,21 @@ void Window::settingsDialog() {
     if (!modal)
         return;
     modal->setObjectName("settingsModal");
+    // Playback stays paused for as long as settings are open, whatever tries to resume it.
+    auto holdPause = [this] {
+        const auto idle = player_.property("idle-active");
+        if (idle.isValid() && !idle.toBool() && !player_.property("pause").toBool())
+            player_.setProperty("pause", true);
+    };
+    holdPause();
+    connect(&player_, &Player::changed, modal, holdPause);
     buildSpeedSettings(modal);
+    buildSkipSetting(modal);
     buildFilePickerSetting(modal);
-    auto *help = text("Space  Play / pause\nLeft / Right  Seek 5 seconds\nUp / Down  "
-                      "Change volume\nM  Mute    F  Fullscreen    P  Queue\nCtrl+O  Open "
-                      "media    Ctrl+Q  Quit\nEscape  Close dialog / leave fullscreen");
+    auto *help = text(QString("Space  Play / pause\nLeft / Right  Seek %1 seconds\nUp / Down  "
+                              "Change volume\nM  Mute    F  Fullscreen    P  Queue\nCtrl+O  Open "
+                              "media    Ctrl+Q  Quit\nEscape  Close dialog / leave fullscreen")
+                          .arg(skipSeconds()));
     help->setWordWrap(true);
     modal->body()->addWidget(help);
     auto *theme = text(
@@ -516,6 +567,50 @@ void Window::buildSpeedSettings(Modal *modal) {
     connect(loop, &QCheckBox::toggled, modal,
             [this](bool on) { player_.setProperty("loop-file", on ? "inf" : "no"); });
 }
+int Window::skipSeconds() const { return qBound(1, settings_.value("playback/skipSeconds", 5).toInt(), 90); }
+void Window::skip(int direction) {
+    player_.command({"seek", QString::number(direction * skipSeconds()), "relative"});
+    if (!video_ || stageStack_->currentWidget() != video_)
+        return;
+    // Back badge centered in the first third of the frame, forward badge in the last third.
+    auto *indicator = direction < 0 ? skipBackIndicator_ : skipForwardIndicator_;
+    const QPoint center = video_->mapTo(content_, QPoint(video_->width() * (direction < 0 ? 1 : 5) / 6,
+                                                         video_->height() / 2));
+    indicator->move(center - QPoint(indicator->width() / 2, indicator->height() / 2));
+    indicator->flashSkip(direction, skipSeconds());
+}
+void Window::updateSkipButtons() {
+    const QString badge = QString::number(skipSeconds());
+    for (auto *button : {skipBack_, skipForward_}) {
+        const bool back = button == skipBack_;
+        const QString label = QString("%1 %2 seconds (%3)").arg(back ? "Back" : "Forward", badge, back ? "Left" : "Right");
+        button->setBadge(badge);
+        button->setAccessibleName(label);
+        button->setToolTip(label);
+    }
+}
+void Window::buildSkipSetting(Modal *modal) {
+    modal->body()->addWidget(text("Skip length", "heading"));
+    auto *row = new QHBoxLayout;
+    auto *slider = new QSlider(Qt::Horizontal);
+    slider->setRange(1, 90);
+    slider->setValue(skipSeconds());
+    slider->setAccessibleName("Skip length in seconds");
+    slider->setCursor(Qt::PointingHandCursor);
+    auto *value = text(QString::number(skipSeconds()) + " s");
+    value->setMinimumWidth(40);
+    value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    row->addWidget(slider, 1);
+    row->addWidget(value);
+    modal->body()->addLayout(row);
+    connect(slider, &QSlider::valueChanged, modal, [this, value](int seconds) {
+        value->setText(QString::number(seconds) + " s");
+        settings_.setValue("playback/skipSeconds", seconds);
+        updateSkipButtons();
+    });
+    connect(slider, &QSlider::sliderReleased, modal, [this] { settings_.sync(); });
+    connect(slider, &QSlider::actionTriggered, modal, [this] { QTimer::singleShot(0, this, [this] { settings_.sync(); }); });
+}
 void Window::buildFilePickerSetting(Modal *modal) {
     auto *builtIn = new ThemedCheckBox("Use built-in file picker");
     builtIn->setChecked(useBuiltInFilePicker());
@@ -539,8 +634,8 @@ void Window::shortcuts() {
         });
     };
     bind("Space", [this] { player_.command({"cycle", "pause"}); });
-    bind("Left", [this] { player_.command({"seek", "-5", "relative"}); });
-    bind("Right", [this] { player_.command({"seek", "5", "relative"}); });
+    bind("Left", [this] { skip(-1); });
+    bind("Right", [this] { skip(1); });
     bind("Up",
          [this] { player_.setProperty("volume", qMin(100.0, player_.property("volume").toDouble() + 5)); });
     bind("Down",
@@ -559,8 +654,123 @@ void Window::shortcuts() {
     connect(quit, &QShortcut::activated, this, &QWidget::close);
 }
 void Window::fullscreen() { isFullScreen() ? showNormal() : showFullScreen(); }
+void Window::setImmersive(bool on) {
+    if (on == immersive_)
+        return;
+    immersive_ = on;
+    for (auto &bar : bars_) {
+        bar.anim->stop();
+        bar.delay->stop();
+        bar.pos = 1;
+        bar.shown = on;
+        bar.widget->setStyleSheet(on ? "QWidget#bar { background:rgba(0,0,0,170); }" : QString());
+        bar.widget->show();
+    }
+    if (on) {
+        layout_->removeWidget(header_);
+        layout_->removeWidget(footer_);
+        layout_->setContentsMargins(0, 0, 0, 0);
+        layout_->setSpacing(0);
+        header_->setContentsMargins(18, 12, 18, 8);
+        footer_->setContentsMargins(18, 8, 18, 16);
+        introDone_ = false;
+        hideTimer_->start();
+        placeBars();
+    } else {
+        hideTimer_->stop();
+        header_->setContentsMargins(0, 0, 0, 0);
+        footer_->setContentsMargins(0, 0, 0, 0);
+        layout_->setContentsMargins(18, 12, 18, 16);
+        layout_->setSpacing(10);
+        layout_->insertWidget(0, header_);
+        layout_->addWidget(footer_);
+        content_->unsetCursor();
+    }
+}
+void Window::initBars() {
+    bars_[0] = {header_, nullptr, nullptr, true};
+    bars_[1] = {footer_, nullptr, nullptr, false};
+    for (auto &bar : bars_) {
+        bar.anim = new QVariantAnimation(this);
+        bar.anim->setDuration(220);
+        bar.anim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(bar.anim, &QVariantAnimation::valueChanged, this, [this, &bar](const QVariant &v) {
+            bar.pos = v.toReal();
+            placeBars();
+        });
+        connect(bar.anim, &QVariantAnimation::finished, this, [&bar] {
+            if (bar.pos <= 0)
+                bar.widget->hide();
+        });
+        bar.delay = new QTimer(this);
+        bar.delay->setSingleShot(true);
+        bar.delay->setInterval(1000);
+        connect(bar.delay, &QTimer::timeout, this, [this, &bar] { slideBar(bar, false); });
+    }
+    cursorTimer_ = new QTimer(this);
+    cursorTimer_->setSingleShot(true);
+    cursorTimer_->setInterval(2000);
+    connect(cursorTimer_, &QTimer::timeout, this, [this] {
+        if (immersive_ && isActiveWindow() && !bars_[0].shown && !bars_[1].shown)
+            content_->setCursor(Qt::BlankCursor);
+    });
+}
+void Window::slideBar(Bar &bar, bool show) {
+    bar.delay->stop();
+    if (bar.shown == show)
+        return;
+    bar.shown = show;
+    if (show)
+        bar.widget->show();
+    bar.anim->stop();
+    bar.anim->setStartValue(bar.pos);
+    bar.anim->setEndValue(show ? 1.0 : 0.0);
+    bar.anim->start();
+}
+void Window::placeBars() {
+    int w = content_->width();
+    for (auto &bar : bars_) {
+        int h = bar.widget->sizeHint().height();
+        int y = bar.top ? -qRound((1 - bar.pos) * h) : content_->height() - qRound(bar.pos * h);
+        bar.widget->setGeometry(0, y, w, h);
+        bar.widget->raise();
+    }
+}
+// Both bars show for 2s on entering fullscreen; after that each one slides in while the cursor is over
+// its own edge region and slides out 1s after the cursor leaves it.
+void Window::updateBars(bool immediate) {
+    if (!isFullScreen()) {
+        setImmersive(false);
+        return;
+    }
+    setImmersive(true);
+    QPoint cursor = QCursor::pos();
+    QPoint p = content_->mapFromGlobal(cursor);
+    bool inside = content_->rect().adjusted(-4, -4, 4, 4).contains(p); // slack: the cursor can land just past the edge
+    for (auto &bar : bars_) {
+        int h = bar.widget->sizeHint().height() + 24;
+        bool want = !introDone_ || modal_ ||
+                    (inside && (bar.top ? p.y() < h : p.y() > content_->height() - h));
+        if (want)
+            slideBar(bar, true);
+        else if (bar.shown && immediate)
+            slideBar(bar, false);
+        else if (bar.shown && !bar.delay->isActive())
+            bar.delay->start();
+        if (want)
+            bar.delay->stop();
+    }
+    // Hide the pointer only after it has idled, so it is never lost on refocus or monitor switches.
+    if (cursor != lastCursor_ || !isActiveWindow() || !inside) {
+        lastCursor_ = cursor;
+        content_->unsetCursor();
+        cursorTimer_->start();
+    }
+}
 void Window::resizeEvent(QResizeEvent *e) {
     QMainWindow::resizeEvent(e);
+    if (immersive_)
+        placeBars();
     if (modal_)
         modal_->setGeometry(centralWidget()->rect());
 }
