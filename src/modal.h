@@ -5,6 +5,7 @@
 #include <QWidget>
 class QHBoxLayout;
 namespace mpvideo {
+class ModalMotion;
 class Modal : public QWidget {
     Q_OBJECT
   public:
@@ -27,13 +28,19 @@ class Modal : public QWidget {
   private:
     QWidget *background_;
     QWidget *card_;
+    ModalMotion *motion_;
     QVBoxLayout *body_;
     QHBoxLayout *footer_;
     QPixmap snapshot_;
+    QPixmap frame_;
+    QPixmap cardImage_;
+    bool animating_ = false;
     QPointer<QWidget> previousFocus_;
     bool closing_ = false;
     int preferredHeight_ = 0;
     void capture();
     void fit();
+    void finishDismiss();
+    void captureCard();
 };
 } // namespace mpvideo

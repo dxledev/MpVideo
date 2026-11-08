@@ -127,6 +127,7 @@ class WindowTests : public QObject {
     }
   private slots:
     void initTestCase() {
+        qputenv("MPVIDEO_REDUCED_MOTION", "1"); // tests must not wait on modal animations
         auto bus = portal_.connection;
         QVERIFY2(bus.registerService("org.freedesktop.portal.Desktop"),
                  "Run window tests with dbus-run-session");

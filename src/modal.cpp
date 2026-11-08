@@ -1,5 +1,6 @@
 #include "modal.h"
 #include "icon_button.h"
+#include "modal_motion.h"
 #include <QApplication>
 #include <QGraphicsBlurEffect>
 #include <QGraphicsPixmapItem>
@@ -32,8 +33,24 @@ Modal::Modal(QWidget *parent, QWidget *background, const QString &title)
     : QWidget(parent), background_(background) {
     setObjectName("modal");
     setFocusPolicy(Qt::StrongFocus);
+    setAttribute(Qt::WA_NoSystemBackground);
     card_ = new QWidget(this);
     card_->setObjectName("modalCard");
+    motion_ = new ModalMotion(this);
+    connect(motion_, &ModalMotion::progressChanged, this, [this] { update(); });
+    connect(motion_, &ModalMotion::finished, this, [this](bool open) {
+        if (open) {
+            // Swap the animated image for the real, fully laid-out card.
+            animating_ = false;
+            cardImage_ = QPixmap();
+            auto *focused = card_->focusWidget();
+            card_->show();
+            if (focused && !closing_)
+                focused->setFocus();
+            update();
+        } else if (closing_)
+            finishDismiss();
+    });
     auto *layout = new QVBoxLayout(card_);
     layout->setContentsMargins(24, 20, 24, 24);
     layout->setSpacing(16);
@@ -61,7 +78,10 @@ Modal::Modal(QWidget *parent, QWidget *background, const QString &title)
 void Modal::capture() {
     // A reduced snapshot is blurred only when opening/resizing, never per video
     // frame.
-    auto image = background_->grab().scaled(QSize(480, 320), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    // Full-size frame of the enabled UI, painted under the fading blur so the
+    // disabled style never shows through mid-animation.
+    frame_ = background_->grab();
+    auto image = frame_.scaled(QSize(480, 320), Qt::KeepAspectRatio, Qt::SmoothTransformation);
     image.setDevicePixelRatio(1);
     if (image.isNull())
         return;
@@ -76,6 +96,12 @@ void Modal::capture() {
     QPainter p(&snapshot_);
     scene.render(&p, QRectF(QPointF(), image.size()), QRectF(QPointF(32, 32), image.size()));
 }
+void Modal::captureCard() {
+    // One snapshot of the finished card; animating this keeps children from
+    // popping in one by one and keeps the backdrop from showing through.
+    card_->layout()->activate();
+    cardImage_ = card_->grab();
+}
 void Modal::fit() {
     int cardHeight =
         qMin((preferredHeight_ > 0 ? preferredHeight_ : qBound(300, body_->sizeHint().height() + 110, 550)),
@@ -85,6 +111,7 @@ void Modal::fit() {
 }
 void Modal::present() {
     previousFocus_ = QApplication::focusWidget();
+    motion_->reset();
     setGeometry(parentWidget()->rect());
     capture();
     background_->setEnabled(false);
@@ -92,14 +119,28 @@ void Modal::present() {
     raise();
     fit();
     setFocus();
+    captureCard();
+    card_->hide();
+    animating_ = true;
+    motion_->animate(true);
 }
 void Modal::dismiss() {
     if (closing_)
         return;
     closing_ = true;
+    setFocus(); // keep keys off the card's buttons for the fade, so handlers can't fire twice
+    captureCard();
+    card_->hide();
+    animating_ = true;
+    motion_->animate(false);
+}
+void Modal::finishDismiss() {
     background_->setEnabled(true);
     hide();
     snapshot_ = QPixmap();
+    frame_ = QPixmap();
+    cardImage_ = QPixmap();
+    animating_ = false;
     if (previousFocus_)
         previousFocus_->setFocus();
     emit dismissed();
@@ -108,10 +149,24 @@ void Modal::dismiss() {
 void Modal::paintEvent(QPaintEvent *) {
     QPainter p(this);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
+    p.setCompositionMode(QPainter::CompositionMode_Source);
+    p.drawPixmap(rect(), frame_);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    p.setOpacity(motion_->progress());
     p.drawPixmap(rect(), snapshot_);
     auto tint = palette().window().color();
     tint.setAlpha(110);
     p.fillRect(rect(), tint);
+    if (animating_ && !cardImage_.isNull()) {
+        const auto progress = motion_->progress();
+        const auto scale = motion_->scale();
+        const auto geometry = QRectF(card_->geometry());
+        p.setOpacity(progress);
+        p.translate(geometry.center());
+        p.scale(scale, scale);
+        p.translate(-geometry.center());
+        p.drawPixmap(geometry.topLeft(), cardImage_);
+    }
 }
 void Modal::changeEvent(QEvent *event) {
     QWidget::changeEvent(event);
@@ -122,11 +177,13 @@ void Modal::changeEvent(QEvent *event) {
 }
 void Modal::resizeEvent(QResizeEvent *) { fit(); }
 void Modal::mousePressEvent(QMouseEvent *event) {
-    if (!card_->geometry().contains(event->position().toPoint()))
+    if (!closing_ && !card_->geometry().contains(event->position().toPoint()))
         dismiss();
 }
 void Modal::keyPressEvent(QKeyEvent *event) {
-    if (event->key() == Qt::Key_Escape)
+    if (closing_)
+        event->accept();
+    else if (event->key() == Qt::Key_Escape)
         dismiss();
     else
         QWidget::keyPressEvent(event);

@@ -310,6 +310,7 @@ void Player::wakeupCallback(void *context) noexcept {
 
 void Player::observeProperties() {
     registerObservation("media-title", MPV_FORMAT_STRING);
+    registerObservation("path", MPV_FORMAT_STRING);
     registerObservation("pause", MPV_FORMAT_FLAG);
     registerObservation("time-pos", MPV_FORMAT_DOUBLE);
     registerObservation("duration", MPV_FORMAT_DOUBLE);

@@ -58,6 +58,11 @@ class IconButton : public QPushButton {
             p.drawPolyline(QPolygonF{QPointF(3, 19), QPointF(3, 6), QPointF(10, 6), QPointF(12, 9),
                                      QPointF(21, 9), QPointF(19, 19), QPointF(3, 19), QPointF(6, 11),
                                      QPointF(18, 11)});
+        } else if (symbol_ == "cut") {
+            p.drawEllipse(QPointF(7, 17), 3, 3);
+            p.drawEllipse(QPointF(17, 17), 3, 3);
+            p.drawLine(QPointF(9, 15), QPointF(17, 4));
+            p.drawLine(QPointF(15, 15), QPointF(7, 4));
         } else if (symbol_ == "queue") {
             for (int y : {6, 12, 18}) {
                 p.drawLine(4, y, 5, y);

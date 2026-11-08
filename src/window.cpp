@@ -4,6 +4,7 @@
 #include "modal.h"
 #include "pause_indicator.h"
 #include "seek_slider.h"
+#include "trim_timeline.h"
 #include "themed_checkbox.h"
 #include "video_widget.h"
 #include <QApplication>
@@ -19,6 +20,8 @@
 #include <QListWidget>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QProcess>
+#include <optional>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -27,7 +30,9 @@
 #include <QVariantAnimation>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 namespace mpvideo {
 namespace {
@@ -65,6 +70,50 @@ QString stamp(double value) {
                            .arg(s / 60 % 60, 2, 10, QChar('0'))
                            .arg(s % 60, 2, 10, QChar('0'))
                      : QString("%1:%2").arg(s / 60).arg(s % 60, 2, 10, QChar('0'));
+}
+struct Encoder {
+    QString name;
+    QStringList input; // before -i
+    QStringList codec; // output video options
+    QString filter;    // appended to the filter graph, applied to the concat output
+};
+bool probeEncoder(const Encoder &e) {
+    QProcess p;
+    QStringList args{"-hide_banner", "-loglevel", "error", "-nostdin"};
+    args << e.input << "-f" << "lavfi" << "-i" << "color=c=black:s=320x240:d=0.2:r=10";
+    if (!e.filter.isEmpty())
+        args << "-vf" << e.filter;
+    args << e.codec << "-frames:v" << "2" << "-f" << "null" << "-";
+    p.start("ffmpeg", args);
+    return p.waitForFinished(4000) && p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
+}
+// First hardware H.264 encoder that really works on this machine, else x264 tuned for speed.
+Encoder pickEncoder(bool hardware, const QString &extension) {
+    static std::optional<Encoder> cached;
+    const bool mp4Family = QStringList{"mp4", "mkv", "mov", "m4v"}.contains(extension);
+    const Encoder software{"x264", {}, {"-c:v", "libx264", "-preset", "veryfast", "-crf", "20"}, {}};
+    if (extension == "webm")
+        return {"VP9", {}, {"-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1",
+                            "-crf", "32", "-b:v", "0"}, {}};
+    if (!mp4Family) // other containers: let ffmpeg choose the codec
+        return {"default", {}, {}, {}};
+    if (!hardware)
+        return software;
+    if (!cached) {
+        QList<Encoder> candidates{
+            {"NVENC", {}, {"-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "21", "-b:v", "0"}, "format=nv12"}};
+        for (const char *dev : {"/dev/dri/renderD128", "/dev/dri/renderD129"})
+            candidates.append({"VAAPI", {"-vaapi_device", dev}, {"-c:v", "h264_vaapi", "-qp", "21"},
+                               "format=nv12,hwupload"});
+        candidates.append({"QSV", {}, {"-c:v", "h264_qsv", "-global_quality", "21"}, "format=nv12"});
+        cached = software;
+        for (const auto &c : candidates)
+            if (probeEncoder(c)) {
+                cached = c;
+                break;
+            }
+    }
+    return *cached;
 }
 QLabel *text(QString value, QString name = {}) {
     auto *label = new QLabel(value);
@@ -106,6 +155,11 @@ Window::Window(QString configPath, const QStringList &mpvOptions)
     refresh();
 }
 Window::~Window() {
+    if (export_) {
+        export_->disconnect();
+        export_->kill();
+        export_->waitForFinished(1000);
+    }
     delete desktopFilePicker_;
     delete takeCentralWidget();
 }
@@ -138,6 +192,7 @@ void Window::build() {
     buildHeader(headerLayout);
     buildStage(layout_);
     layout_->addWidget(footer_);
+    buildEditBar(footerLayout);
     buildTransport(footerLayout);
     hideTimer_ = new QTimer(this);
     hideTimer_->setSingleShot(true);
@@ -163,6 +218,10 @@ void Window::buildHeader(QVBoxLayout *layout) {
     title_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     header->addSpacing(18);
     header->addWidget(title_, 1);
+    cut_ = makeButton("cut", "Edit video", [this] { toggleEdit(); });
+    cut_->setCheckable(true);
+    cut_->setEnabled(false);
+    header->addWidget(cut_);
     header->addWidget(makeButton("open", "Open media (Ctrl+O)", [this] { fileDialog(); }));
     header->addWidget(
         makeButton("queue", "Toggle queue (P)", [this] { queue_->setVisible(!queue_->isVisible()); }));
@@ -290,6 +349,13 @@ QSlider::groove:horizontal { height:4px; background:%8; border-radius:2px; }
 QSlider::add-page:horizontal { background:%8; border-radius:2px; }
 QSlider::sub-page:horizontal { background:%7; border-radius:2px; }
 QSlider::handle:horizontal { background:%7; width:12px; margin:-4px 0; border-radius:6px; }
+QPushButton#primary { background:%7; color:%9; border-color:%7; font-weight:600; padding:6px 16px; }
+QPushButton#primary:hover { background:%7; border-color:%9; } QPushButton#primary:disabled { background:%8; color:%5; border-color:%8; }
+QPushButton#primary:focus { border-color:%9; }
+QPushButton:checked { background:%3; }
+QMenu { background:%4; border:1px solid %3; border-radius:8px; padding:4px; }
+QMenu::item { padding:7px 22px 7px 14px; border-radius:5px; } QMenu::item:selected { background:%6; }
+QMenu::item:disabled { color:%5; }
 QScrollArea { background:transparent; border:0; } QScrollBar:vertical { background:%4; width:8px; } QScrollBar::handle:vertical { background:%3; min-height:24px; } QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
 )")
                             .arg(c("text"), c("background"), c("border"), c("surface"), c("muted"),
@@ -309,9 +375,36 @@ void Window::refresh() {
     play_->setSymbol(pendingPause_.value_or(paused) || idle ? "play" : "pause");
     play_->setEnabled(!idle);
     seek_->setEnabled(duration > 0);
+    {
+        const auto path = currentPath();
+        const bool canEdit = !idle && duration > 0 && !path.isEmpty();
+        cut_->setEnabled(canEdit && !export_);
+        if (editing_ && (!canEdit || path != editPath_) && !export_)
+            exitEdit();
+    }
     if (!seek_->isSliderDown()) {
         QSignalBlocker block(seek_);
         seek_->setValue(duration > 0 ? qBound(0, int(pos / duration * 10000), 10000) : 0);
+    }
+    if (editing_ && !export_) {
+        trim_->setPlayhead(pos);
+        // Playing through the editor skips what has been removed.
+        if (!paused && !pendingPause_ && !idle) {
+            const auto &segs = trim_->segments();
+            if (trim_->indexAt(pos) >= 0)
+                lastGapSkip_ = -1;
+            else {
+                auto next = std::find_if(segs.begin(), segs.end(), [pos](const auto &sg) { return sg.start > pos; });
+                if (next == segs.end()) {
+                    pendingPause_ = true;
+                    player_.setProperty("pause", true);
+                    player_.command({"seek", QString::number(segs.last().end, 'f', 3), "absolute+exact"});
+                } else if (lastGapSkip_ != next->start) {
+                    lastGapSkip_ = next->start;
+                    player_.command({"seek", QString::number(next->start, 'f', 3), "absolute+exact"});
+                }
+            }
+        }
     }
     if (const auto stampText = stamp(pos) + " / " + stamp(duration); time_->text() != stampText)
         time_->setText(stampText);
@@ -343,6 +436,305 @@ void Window::refresh() {
     }
     if (const int row = player_.property("playlist-pos").toInt(); queue_->currentRow() != row)
         queue_->setCurrentRow(row);
+}
+QString Window::currentPath() const {
+    const auto path = player_.property("path").toString();
+    return !path.isEmpty() && QFileInfo(path).isFile() ? QFileInfo(path).absoluteFilePath() : QString();
+}
+void Window::buildEditBar(QVBoxLayout *layout) {
+    editBar_ = new QWidget(footer_);
+    editBar_->setObjectName("editBar");
+    editBar_->hide();
+    auto *row = new QHBoxLayout(editBar_);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(10);
+    auto *hint = text("Drag the ends to trim · right-click to split or delete", "status");
+    hint->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    keepLabel_ = text("", "keep");
+    stopCut_ = new QPushButton("Stop");
+    stopCut_->setCursor(Qt::PointingHandCursor);
+    stopCut_->hide();
+    saveCut_ = new QPushButton("Save…");
+    saveCut_->setObjectName("primary");
+    saveCut_->setCursor(Qt::PointingHandCursor);
+    row->addWidget(hint, 1);
+    row->addWidget(keepLabel_);
+    row->addWidget(stopCut_);
+    row->addWidget(saveCut_);
+    layout->addWidget(editBar_);
+    trim_ = new TrimTimeline(footer_);
+    trim_->hide();
+    layout->addWidget(trim_);
+    trim_->onSeek = [this](double seconds, bool final) {
+        player_.command({"seek", QString::number(seconds, 'f', 3), final ? "absolute+exact" : "absolute+keyframes"});
+    };
+    trim_->onChanged = [this] { updateEdit(); };
+    connect(stopCut_, &QPushButton::clicked, this, [this] {
+        if (export_)
+            export_->kill();
+    });
+    connect(saveCut_, &QPushButton::clicked, this, [this] { saveDialog(); });
+    // Created disabled: an always-on Delete here would clash with the queue's own Delete shortcut.
+    auto bindEdit = [this](QKeySequence key, auto fn) {
+        auto *s = new QShortcut(key, this);
+        s->setEnabled(false);
+        editKeys_.append(s);
+        connect(s, &QShortcut::activated, this, [this, fn] {
+            if (editing_ && !modal_ && !export_)
+                fn();
+        });
+    };
+    bindEdit(QKeySequence("Ctrl+Z"), [this] { trim_->undo(); });
+    bindEdit(QKeySequence("S"), [this] { trim_->splitAt(player_.property("time-pos").toDouble()); });
+    bindEdit(QKeySequence::Delete, [this] { trim_->removeAt(player_.property("time-pos").toDouble()); });
+}
+void Window::toggleEdit() {
+    if (editing_)
+        requestExitEdit();
+    else {
+        editPath_ = currentPath();
+        const double duration = player_.property("duration").toDouble();
+        if (editPath_.isEmpty() || duration <= 0) {
+            cut_->setChecked(false);
+            return;
+        }
+        player_.setProperty("pause", true);
+        editing_ = true;
+        for (auto *k : std::as_const(editKeys_))
+            k->setEnabled(true);
+        cut_->setChecked(true);
+        cut_->setToolTip("Exit editor");
+        trim_->reset(duration);
+        trim_->setPlayhead(player_.property("time-pos").toDouble());
+        seek_->hide();
+        editBar_->show();
+        trim_->show();
+        updateEdit();
+        replaceBars();
+    }
+}
+// Leaving with unsaved edits asks first, inside the window.
+void Window::requestExitEdit() {
+    if (!editing_)
+        return;
+    if (export_) {
+        cut_->setChecked(true);
+        return;
+    }
+    if (!trim_->isModified()) {
+        exitEdit();
+        return;
+    }
+    cut_->setChecked(true);
+    auto *modal = dialog("Discard your edits?");
+    if (!modal)
+        return;
+    auto *info = text("Your cuts haven't been saved. Leaving the editor will discard them.");
+    info->setWordWrap(true);
+    modal->body()->addWidget(info);
+    modal->body()->addStretch();
+    auto *keep = new QPushButton("Keep editing");
+    auto *discard = new QPushButton("Discard edits");
+    discard->setObjectName("primary");
+    keep->setCursor(Qt::PointingHandCursor);
+    discard->setCursor(Qt::PointingHandCursor);
+    modal->footer()->addStretch();
+    modal->footer()->addWidget(keep);
+    modal->footer()->addWidget(discard);
+    connect(keep, &QPushButton::clicked, modal, &Modal::dismiss);
+    connect(discard, &QPushButton::clicked, modal, [this, modal] {
+        modal->dismiss();
+        exitEdit();
+    });
+    modal->present();
+    keep->setFocus();
+}
+// Fullscreen bars are positioned by hand, so re-measure after the footer gains or loses rows.
+void Window::replaceBars() {
+    if (!immersive_)
+        return;
+    footer_->layout()->activate();
+    placeBars();
+}
+void Window::exitEdit() {
+    editing_ = false;
+    for (auto *k : std::as_const(editKeys_))
+        k->setEnabled(false);
+    editBar_->hide();
+    trim_->hide();
+    seek_->show();
+    cut_->setChecked(false);
+    cut_->setToolTip("Edit video");
+    cuts_.clear();
+    editPath_.clear();
+    replaceBars();
+}
+void Window::updateEdit() {
+    cuts_ = trim_->cuts();
+    const double duration = trim_->duration();
+    keepLabel_->setText(QString("Keeps %1 of %2").arg(stamp(trim_->keptSeconds()), stamp(duration)));
+    keepLabel_->setProperty("changed", !cuts_.isEmpty());
+    saveCut_->setEnabled(!cuts_.isEmpty() && !export_);
+    stopCut_->setVisible(bool(export_));
+    trim_->setEnabled(!export_);
+}
+void Window::saveDialog() {
+    if (cuts_.isEmpty() || export_)
+        return;
+    auto *modal = dialog("Save edited video");
+    if (!modal)
+        return;
+    auto *info = text(QString("%1 cut%2 will be removed; the rest is kept. The video is re-encoded so cuts land exactly.")
+                          .arg(cuts_.size())
+                          .arg(cuts_.size() == 1 ? "" : "s"));
+    info->setWordWrap(true);
+    modal->body()->addWidget(info);
+    auto *asNew = new QPushButton("Save as new");
+    auto *changes = new QPushButton("Save changes");
+    modal->body()->addWidget(asNew);
+    modal->body()->addWidget(text("Keeps the original and writes a separate “(cut)” file.", "status"));
+    modal->body()->addWidget(changes);
+    modal->body()->addWidget(text("Overwrites the original file with the edited video (only what you kept).", "status"));
+    modal->body()->addStretch();
+    connect(asNew, &QPushButton::clicked, modal, [this, modal] {
+        modal->dismiss();
+        exportCuts(false);
+    });
+    connect(changes, &QPushButton::clicked, modal, [this, modal] {
+        modal->dismiss();
+        exportCuts(true);
+    });
+    modal->present();
+}
+void Window::exportCuts(bool overwrite) {
+    const double duration = player_.property("duration").toDouble();
+    if (editPath_.isEmpty() || duration <= 0 || export_)
+        return;
+    // Merge the cuts, then keep their complement.
+    QVector<QPair<double, double>> merged;
+    for (auto c : std::as_const(cuts_)) {
+        c.first = qMax(0.0, c.first);
+        c.second = qMin(duration, c.second);
+        if (!merged.isEmpty() && c.first <= merged.last().second)
+            merged.last().second = qMax(merged.last().second, c.second);
+        else
+            merged.append(c);
+    }
+    QVector<QPair<double, double>> keep;
+    double at = 0;
+    for (const auto &c : merged) {
+        if (c.first - at > 0.05)
+            keep.append({at, c.first});
+        at = c.second;
+    }
+    if (duration - at > 0.05)
+        keep.append({at, duration});
+    if (keep.isEmpty()) {
+        status_->setText("Nothing would be left after these cuts.");
+        return;
+    }
+    bool hasAudio = false, hasVideo = false;
+    for (const auto &t : player_.tracks()) {
+        const auto type = t.toMap().value("type").toString();
+        hasAudio |= type == "audio";
+        hasVideo |= type == "video";
+    }
+    QString graph, inputs;
+    for (int i = 0; i < keep.size(); ++i) {
+        const auto range = QString("start=%1:end=%2").arg(keep[i].first, 0, 'f', 3).arg(keep[i].second, 0, 'f', 3);
+        if (hasVideo) {
+            graph += QString("[0:v:0]trim=%1,setpts=PTS-STARTPTS[v%2];").arg(range).arg(i);
+            inputs += QString("[v%1]").arg(i);
+        }
+        if (hasAudio) {
+            graph += QString("[0:a:0]atrim=%1,asetpts=PTS-STARTPTS[a%2];").arg(range).arg(i);
+            inputs += QString("[a%1]").arg(i);
+        }
+    }
+    const QFileInfo src(editPath_);
+    const QString suffix = src.suffix().isEmpty() ? QString() : "." + src.suffix();
+    const Encoder enc = pickEncoder(useHardwareEncoder(), src.suffix().toLower());
+    graph += QString("%1concat=n=%2:v=%3:a=%4%5%6")
+                 .arg(inputs).arg(keep.size()).arg(hasVideo ? 1 : 0).arg(hasAudio ? 1 : 0)
+                 .arg(hasVideo ? (enc.filter.isEmpty() ? "[v]" : "[vc]") : "", hasAudio ? "[a]" : "");
+    if (hasVideo && !enc.filter.isEmpty())
+        graph += QString(";[vc]%1[v]").arg(enc.filter);
+    double total = 0;
+    for (const auto &k : keep)
+        total += k.second - k.first;
+
+    QString output;
+    if (overwrite) {
+        output = src.dir().filePath("." + src.completeBaseName() + ".mpvideo-tmp" + suffix);
+    } else {
+        output = src.dir().filePath(src.completeBaseName() + " (cut)" + suffix);
+        for (int n = 2; QFileInfo::exists(output); ++n)
+            output = src.dir().filePath(QString("%1 (cut %2)%3").arg(src.completeBaseName()).arg(n).arg(suffix));
+    }
+    QStringList args{"-y", "-nostdin", "-loglevel", "error", "-progress", "pipe:1"};
+    args << enc.input;
+    if (enc.name == "NVENC" || enc.name == "VAAPI" || enc.name == "QSV")
+        args << "-hwaccel" << "auto";
+    args << "-i" << editPath_ << "-filter_complex" << graph;
+    if (hasVideo)
+        args << "-map" << "[v]" << enc.codec;
+    if (hasAudio)
+        args << "-map" << "[a]";
+    if (hasAudio && src.suffix().toLower() == "webm")
+        args << "-c:a" << "libopus";
+    args << output;
+
+    auto *proc = new QProcess(this);
+    export_ = proc;
+    cut_->setEnabled(false);
+    updateEdit();
+    status_->setText(QString("Saving with %1… 0%  (Stop to cancel)").arg(enc.name));
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc, total, encName = enc.name] {
+        const auto lines = QString::fromUtf8(proc->readAllStandardOutput()).split('\n');
+        for (const auto &line : lines)
+            if (line.startsWith("out_time_us=")) {
+                const double done = line.mid(12).toDouble() / 1e6;
+                status_->setText(QString("Saving with %1… %2%  (Stop to cancel)")
+                                     .arg(encName).arg(qBound(0, int(done / total * 100), 99)));
+            }
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, proc, output](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart)
+            return;
+        status_->setText("Could not start ffmpeg. Is it installed?");
+        QFile::remove(output);
+        proc->deleteLater();
+        export_.clear();
+        updateEdit();
+    });
+    connect(proc, &QProcess::finished, this,
+            [this, proc, output, overwrite](int code, QProcess::ExitStatus st) {
+                const auto err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+                proc->deleteLater();
+                export_.clear();
+                const QString original = editPath_;
+                if (st != QProcess::NormalExit || code != 0) {
+                    QFile::remove(output);
+                    status_->setText(st == QProcess::CrashExit ? "Save cancelled."
+                                                               : "Save failed: " + err.left(200));
+                    updateEdit();
+                    return;
+                }
+                QString result = output;
+                if (overwrite) {
+                    if (std::rename(output.toLocal8Bit().constData(), original.toLocal8Bit().constData()) != 0) {
+                        QFile::remove(output);
+                        status_->setText("Could not replace the original file.");
+                        updateEdit();
+                        return;
+                    }
+                    result = original;
+                }
+                exitEdit();
+                player_.command({"loadfile", result, "replace"});
+                status_->setText("Saved " + QFileInfo(result).fileName());
+            });
+    proc->start("ffmpeg", args);
 }
 void Window::open(const QStringList &paths, bool append) {
     if (paths.isEmpty() || !player_.isReady())
@@ -518,8 +910,8 @@ void Window::trackDialog() {
     auto *load = new QPushButton("Load subtitle file…");
     modal->body()->addWidget(load);
     connect(load, &QPushButton::clicked, modal, [this, modal] {
+        connect(modal, &Modal::dismissed, this, [this] { QTimer::singleShot(0, this, [this] { fileDialog(true); }); });
         modal->dismiss();
-        QTimer::singleShot(0, this, [this] { fileDialog(true); });
     });
     modal->present();
 }
@@ -539,9 +931,16 @@ void Window::settingsDialog() {
     buildSpeedSettings(modal);
     buildSkipSetting(modal);
     buildFilePickerSetting(modal);
+    auto *hardware = new ThemedCheckBox("Use the hardware encoder when available");
+    hardware->setChecked(useHardwareEncoder());
+    modal->body()->addWidget(hardware);
+    connect(hardware, &QCheckBox::toggled, modal, [this](bool on) {
+        settings_.setValue("export/hardwareEncoder", on);
+        settings_.sync();
+    });
     auto *help = text(QString("Space  Play / pause\nLeft / Right  Seek %1 seconds\nUp / Down  "
                               "Change volume\nM  Mute    F  Fullscreen    P  Queue\nCtrl+O  Open "
-                              "media    Ctrl+Q  Quit\nEscape  Close dialog / leave fullscreen")
+                              "media    Ctrl+Q  Quit\nEscape  Close dialog / leave fullscreen\nEditor  S split at playhead    Delete  Remove segment    Ctrl+Z  Undo")
                           .arg(skipSeconds()));
     help->setWordWrap(true);
     modal->body()->addWidget(help);
@@ -577,10 +976,14 @@ void Window::buildSpeedSettings(Modal *modal) {
     connect(loop, &QCheckBox::toggled, modal,
             [this](bool on) { player_.setProperty("loop-file", on ? "inf" : "no"); });
 }
+bool Window::useHardwareEncoder() const { return settings_.value("export/hardwareEncoder", true).toBool(); }
 int Window::skipSeconds() const { return qBound(1, settings_.value("playback/skipSeconds", 5).toInt(), 90); }
 // mpv reports "pause" asynchronously, so rapid toggles track the requested state instead of the cached one.
 void Window::togglePause() {
     const bool nowPaused = !pendingPause_.value_or(player_.property("pause").toBool());
+    if (!nowPaused && editing_ && !trim_->segments().isEmpty() &&
+        player_.property("time-pos").toDouble() >= trim_->segments().last().end - 0.1)
+        player_.command({"seek", QString::number(trim_->segments().first().start, 'f', 3), "absolute+exact"});
     pendingPause_ = nowPaused;
     player_.setProperty("pause", nowPaused);
     play_->setSymbol(nowPaused ? "play" : "pause");
@@ -771,7 +1174,7 @@ void Window::updateBars(bool immediate) {
     bool inside = content_->rect().adjusted(-4, -4, 4, 4).contains(p); // slack: the cursor can land just past the edge
     for (auto &bar : bars_) {
         int h = bar.widget->sizeHint().height() + 24;
-        bool want = !introDone_ || modal_ ||
+        bool want = !introDone_ || modal_ || editing_ ||
                     (inside && (bar.top ? p.y() < h : p.y() > content_->height() - h));
         if (want)
             slideBar(bar, true);
@@ -821,6 +1224,8 @@ void Window::keyPressEvent(QKeyEvent *e) {
             desktopFilePicker_->cancel();
         else if (modal_)
             modal_->dismiss();
+        else if (editing_)
+            requestExitEdit();
         else if (isFullScreen())
             showNormal();
     } else

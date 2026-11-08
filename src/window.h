@@ -4,7 +4,9 @@
 #include "player.h"
 #include <QMainWindow>
 #include <QPointer>
+#include <QPair>
 #include <QSettings>
+#include <QVector>
 #include <functional>
 class QLabel;
 class QSlider;
@@ -13,11 +15,15 @@ class QLineEdit;
 class QVBoxLayout;
 class QStackedLayout;
 class QTimer;
+class QProcess;
+class QPushButton;
+class QShortcut;
 class QVariantAnimation;
 namespace mpvideo {
 class DesktopFilePicker;
 class VideoWidget;
 class IconButton;
+class TrimTimeline;
 class Modal;
 class PauseIndicator;
 class Window : public QMainWindow {
@@ -75,6 +81,18 @@ class Window : public QMainWindow {
     IconButton *skipForward_;
     IconButton *mute_;
     QListWidget *queue_;
+    IconButton *cut_ = nullptr;
+    QWidget *editBar_ = nullptr;
+    TrimTimeline *trim_ = nullptr;
+    QLabel *keepLabel_ = nullptr;
+    QPushButton *saveCut_ = nullptr;
+    QPushButton *stopCut_ = nullptr;
+    QVector<QPair<double, double>> cuts_;
+    bool editing_ = false;
+    QList<QShortcut *> editKeys_;
+    double lastGapSkip_ = -1;
+    QString editPath_;
+    QPointer<QProcess> export_;
     QPointer<Modal> modal_;
     QPointer<DesktopFilePicker> desktopFilePicker_;
     void build();
@@ -89,6 +107,15 @@ class Window : public QMainWindow {
     void builtInFileDialog(bool subtitles);
     void desktopFileDialog(bool subtitles);
     bool useBuiltInFilePicker() const;
+    void buildEditBar(QVBoxLayout *layout);
+    void toggleEdit();
+    void exitEdit();
+    void requestExitEdit();
+    void replaceBars();
+    void updateEdit();
+    void saveDialog();
+    void exportCuts(bool overwrite);
+    QString currentPath() const;
     void trackDialog();
     void settingsDialog();
     void buildSpeedSettings(Modal *modal);
@@ -96,6 +123,7 @@ class Window : public QMainWindow {
     Modal *dialog(const QString &title);
     void fullscreen();
     int skipSeconds() const;
+    bool useHardwareEncoder() const;
     void skip(int direction);
     void updateSkipButtons();
     void buildSkipSetting(Modal *modal);
